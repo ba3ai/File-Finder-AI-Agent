@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    font-family: ui-sans-serif, -apple-system, system-ui, Segoe UI, Helvetica, Apple Color Emoji, Arial, sans-serif, Segoe UI Emoji, Segoe UI Symbol;
+}
+@layer utilities {
+  @keyframes shine {
+    0% {
+      background-position: -200% center;
+    }
+    100% {
+      background-position: 200% center;
+    }
+  }
+
+  .animate-shine {
+    background-size: 200% auto;
+    animation: shine 2s linear infinite;
+  }
+  /* Add this to your global CSS */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent; /* or use a subtle background */
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #555; /* darker thumb */
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: #777;
+}
+
+}
+
+
+/* Theme tokens */
+:root {
+  --bg: #f6f8fb;
+  --text: #0b1220;
+  --panel: #ffffff;
+  --panelTint: rgba(255,255,255,.7);
+  --border: rgba(0,0,0,.12);
+}
+html.dark {
+  --bg: #0b1324;
+  --text: #ffffff;
+  --panel: #0f1a33;
+  --panelTint: rgba(15,26,51,.70);
+  --border: rgba(255,255,255,.10);
+}
+
+/* Small helpers so you don’t have to touch every component */
+.theme-surface { background: var(--bg); color: var(--text); }
+.theme-card    { background: var(--panel); border-color: var(--border); }
+.theme-tint    { background: var(--panelTint); }
+.theme-border  { border-color: var(--border); }
+.theme-text    { color: var(--text); }
+
