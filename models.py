@@ -6,6 +6,8 @@ from typing import Optional, Dict, Any
 
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
+import uuid
+from datetime import datetime, timedelta
 
 db = SQLAlchemy()
 
@@ -242,3 +244,113 @@ class EmailLog(db.Model):
     error = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+
+# ------------- Workspaces (Team Seats) -------------
+
+class Workspace(db.Model):
+    __tablename__ = "workspaces"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(160), nullable=False)
+    owner_user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    seats_limit = db.Column(db.Integer, nullable=False, default=3)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    owner = db.relationship("User", foreign_keys=[owner_user_id])
+    members = db.relationship("WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan")
+
+    @property
+    def seats_used(self) -> int:
+        # count active members
+        return len([m for m in self.members if m.status == "active"])
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "owner_user_id": self.owner_user_id,
+            "seats_limit": self.seats_limit,
+            "seats_used": self.seats_used,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class WorkspaceMember(db.Model):
+    __tablename__ = "workspace_members"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+
+    role = db.Column(db.String(20), default="member")  # 'owner' | 'admin' | 'member'
+    status = db.Column(db.String(20), default="active")  # 'active' | 'invited' | 'removed'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    workspace = db.relationship("Workspace", back_populates="members")
+    user = db.relationship("User")
+
+    __table_args__ = (
+        db.UniqueConstraint("workspace_id", "user_id", name="uq_workspace_user"),
+    )
+
+    def as_dict(self) -> Dict[str, Any]:
+        u = self.user
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "user_id": self.user_id,
+            "role": self.role,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "user": {
+                "id": u.id,
+                "email": u.email,
+                "name": getattr(u, "display_name", None) or getattr(u, "name", None) or (u.email.split("@")[0] if u.email else "User"),
+            } if u else None
+        }
+
+
+# ---- Workspace Invitations ----------------------------------------------------
+
+class WorkspaceInvite(db.Model):
+    __tablename__ = "workspace_invites"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces.id"), nullable=False)
+    email = db.Column(db.String(255), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False, default="member")   # 'member' | 'admin' | 'owner'
+    token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    status = db.Column(db.String(20), nullable=False, default="pending")  # 'pending' | 'accepted' | 'revoked' | 'expired'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, default=lambda: datetime.utcnow() + timedelta(days=14))
+
+    workspace = db.relationship("Workspace", backref="invites")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "email": self.email,
+            "role": self.role,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+        }
+
+    @staticmethod
+    def new_token() -> str:
+        return uuid.uuid4().hex + uuid.uuid4().hex
+    
+class WorkspaceJoinRequest(db.Model):
+    __tablename__ = "workspace_join_requests"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces.id"), nullable=False)
+    email = db.Column(db.String(255), nullable=False, index=True)
+    role = db.Column(db.String(32), default="member")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "workspace_id": self.workspace_id,
+            "email": (self.email or "").lower(),
+            "role": self.role or "member",
+            "created_at": (self.created_at.isoformat() if self.created_at else None),
+        }

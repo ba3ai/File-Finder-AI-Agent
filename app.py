@@ -8,7 +8,7 @@ from functools import wraps
 from datetime import timedelta, datetime, UTC, timezone  # >>> CHANGED (added timezone)
 from dateutil.parser import isoparse
 
-from flask import Flask, request, jsonify, send_from_directory, session, current_app, redirect
+from flask import Flask, request, jsonify, send_from_directory, session, current_app, redirect, make_response
 from flask_session import Session
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -19,10 +19,28 @@ from flask_login import login_required, current_user
 from auth import auth_bp, login_manager
 from models import db, Prefs  # <-- Prefs used to store per-user flags/tokens
 import requests as _rq
+from admin_models import StaffUser   # model that stores staff accounts
+from werkzeug.security import generate_password_hash
+from datetime import datetime
+from admin_api import admin_bp
 # (Optional) App-only flow still available if you need it for admin/background
 from graph_app_token import get_app_access_token
 # --- at top of file (imports) ---
 from services_web_search import web_answer  # <-- add this import
+# backend/app.py (excerpt)
+from askgpt_routes import askgpt_bp
+# app.py
+from app_askgpt import bp as askgpt_bp
+from routes.billing_routes import billing_bp
+from routes.stripe_webhooks import stripe_wh_bp
+from routes.admin_trial_routes import admin_trial_bp
+from routes.co_routes import billing2co_bp
+from routes.co_webhooks import ins2co_bp
+
+
+
+
+
 
 # Email flow orchestration lives in a single module email_service.py
 from email_service import is_send_email_intent,continue_email_flow,register_outlook_token_loader, register_gmail_creds_loader
@@ -93,7 +111,8 @@ from zoneinfo import ZoneInfo  # >>> ADDED
 # 🔌 Dashboard connections API
 from connections_api import connections_bp
 from smart_content import summarize_from_hits
-
+from config import Config
+from routes.workspaces import workspaces_bp
 # ─────────────────────────────────────────────────────────────────────────────
 # 🌱 Env & logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,6 +122,9 @@ logging.basicConfig(level=logging.INFO)
 # 🚀 Serve the built React app (Vite build outputs to frontend/dist)
 app = Flask(__name__, static_folder="./frontend/dist", static_url_path="/")
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", os.getenv("CLIENT_SECRET", "dev-secret"))
+app.config.from_object(Config)
+app.config.setdefault("FRONTEND_BASE_URL", os.getenv("FRONTEND_BASE_URL", "").rstrip("/"))
+app.config["TEAM_WS_DEV_BYPASS"] = True  # during local dev, let any logged-in user access team/ws routes
 
 # Sessions (server-side; used for chat state/pagination)
 app.config["SESSION_TYPE"] = "filesystem"
@@ -121,10 +143,49 @@ db.init_app(app)
 login_manager.init_app(app)
 with app.app_context():
     db.create_all()
+    def ensure_default_staff_superadmin():
+        email = os.getenv("DEFAULT_SUPERADMIN_EMAIL", "admin@local.test").strip().lower()
+        password = os.getenv("DEFAULT_SUPERADMIN_PASSWORD", "Admin@12345")
+        name = os.getenv("DEFAULT_SUPERADMIN_NAME", "Super Admin")
+
+        su = StaffUser.query.filter_by(email=email).first()
+        if not su:
+            su = StaffUser(
+                email=email,
+                display_name=name,
+                role="superadmin",
+                is_active=True,
+                created_at=datetime.utcnow(),
+            )
+            # set password (model has set_password; fallback to hash)
+            if hasattr(su, "set_password") and callable(getattr(su, "set_password")):
+                su.set_password(password)
+            else:
+                su.password_hash = generate_password_hash(password)
+
+            db.session.add(su)
+            db.session.commit()
+            print(f"🛡️ Default STAFF Super Admin created → {email} / {password}")
+        else:
+            print(f"🛡️ STAFF Super Admin present → {email}")
+
+    ensure_default_staff_superadmin()
 
 # Blueprints
 app.register_blueprint(auth_bp)          # /api/auth/*
 app.register_blueprint(connections_bp)   # /api/connections/*
+app.register_blueprint(admin_bp)
+# after app init and CORS, etc.
+app.register_blueprint(askgpt_bp, url_prefix="/askgpt")
+
+# app.register_blueprint(billing_bp)
+# app.register_blueprint(stripe_wh_bp)
+app.register_blueprint(admin_trial_bp)
+app.register_blueprint(billing2co_bp)
+app.register_blueprint(ins2co_bp)
+app.register_blueprint(workspaces_bp)
+
+
 
 # Initialize your app-specific tables if any
 init_db()
@@ -134,6 +195,7 @@ init_db()
 # ─────────────────────────────────────────────────────────────────────────────
 TRIAL_GATE_ENABLED = os.getenv("TRIAL_ENABLED", "true").lower() == "true"
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+
 
 def _get_pref(uid, key):
     row = Prefs.query.filter_by(user_id=uid, key=key).first()
@@ -311,6 +373,11 @@ def get_user_google_token_or_none():
             if r.ok:
                 j = r.json()
                 acc = j.get("access_token")
+                exp = int(j.get("expires_in", 3600))
+                exp_epoch = int(time.time()) + max(exp - 60, 0)   # <-- epoch, not ISO
+                _set_pref(uid, "google_access_token", acc)
+                _set_pref(uid, "google_expires_at", str(exp_epoch))  # <-- store epoch
+                # keep refresh token if present...
                 if acc:
                     exp = int(j.get("expires_in", 3600))
                     exp_at = (datetime.now(UTC) + timedelta(seconds=max(exp - 60, 0))).isoformat()
@@ -459,6 +526,16 @@ def check_login():
     if current_user.is_authenticated:
         return jsonify(logged_in=True, user_email=getattr(current_user, "email", None))
     return jsonify(logged_in=False)
+
+@app.route("/api/auth/logout", methods=["POST", "GET"])
+def logout():
+    # Clear Flask session (if using session)
+    session.clear()
+
+    # Clear custom cookies (if you set any manually)
+    response = make_response({"message": "Logged out"})
+    response.set_cookie("sessionToken", "", expires=0, path="/")  # remove cookie
+    return response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Document APIs
@@ -802,7 +879,8 @@ def parse_window_and_keywords(text: str):  # >>> ADDED
 def chat():
     """Main chat endpoint with source-aware search across MS Graph, Google Drive, Dropbox, Box, MEGA,
     plus Outlook Mail, Gmail, Outlook Calendar, Google Calendar, and Microsoft Teams.
-    Now upload-aware: if the user attaches files and asks to 'explain/summarize this', we summarize uploads first.
+    Upload-aware: summarize/answer from attachments; and the cloud upload flow (drive choice + validation)
+    is fully delegated to services_cloud_upload.py.
     """
 
     # ───────── local imports to keep this drop-in safe ─────────
@@ -810,6 +888,20 @@ def chat():
     from datetime import datetime, timezone
     from flask import jsonify, request, session, current_app
     from flask_login import current_user
+
+    # Centralized cloud upload module (SharePoint, OneDrive, Google Drive, Dropbox, Box, MEGA)
+    try:
+        from services_cloud_upload import (
+            upload_to_provider,
+            DEFAULT_LIBRARY as SP_DEFAULT_LIB,
+            start_best_upload_flow,
+            handle_best_upload_reply,
+            cancel_upload_flow,
+            is_upload_flow_active,   # ensure this import exists
+        )
+    except Exception:
+        upload_to_provider = None
+        SP_DEFAULT_LIB = os.getenv("SP_LIBRARY", "Shared Documents")
 
     # Upload helpers (your module)
     try:
@@ -898,18 +990,94 @@ def chat():
         bag = session.get("last_selected_files") or {}
         return bag.get(chat_id) or []
 
+    # --- connection checks (per-user) --------------------------------------------
+    def _is_connected_ms() -> bool:
+        try:
+            return bool(get_user_ms_token_or_none())
+        except Exception:
+            return False
+
+    def _is_connected_google() -> bool:
+        try:
+            return bool(get_user_google_token_or_none())
+        except Exception:
+            return False
+
+    def _is_connected_dropbox(uid: int) -> bool:
+        try:
+            from dropbox_api import ensure_dropbox_access_token
+            return bool(ensure_dropbox_access_token(uid))
+        except Exception:
+            return False
+
+    def _is_connected_box(uid: int) -> bool:
+        try:
+            from box_api import ensure_box_access_token
+            return bool(ensure_box_access_token(uid))
+        except Exception:
+            return False
+
+    def _is_connected_mega() -> bool:
+        return bool(os.getenv("MEGA_EMAIL") and os.getenv("MEGA_PASSWORD"))
+
+    def _nice(p: str) -> str:
+        return {
+            "sharepoint": "SharePoint",
+            "onedrive": "OneDrive",
+            "google_drive": "Google Drive",
+            "dropbox": "Dropbox",
+            "box": "Box",
+            "mega": "MEGA",
+        }.get(p, p)
+
+    def _connected_providers():
+        out = []
+        if _is_connected_ms():
+            out.extend(["sharepoint", "onedrive"])
+        if _is_connected_google():
+            out.append("google_drive")
+        if _is_connected_dropbox(current_user.id):
+            out.append("dropbox")
+        if _is_connected_box(current_user.id):
+            out.append("box")
+        if _is_connected_mega():
+            out.append("mega")
+        return out
+
+    # NEW: map UI “sources” to internal upload providers (SharePoint-only, etc.)
+    def _upload_providers_from_sources(sources: list[str]) -> list[str]:
+        if not sources:
+            return []
+        m = {
+            "sharepoint": "sharepoint",
+            "onedrive": "onedrive",
+            "google_drive": "google_drive",
+            "google": "google_drive",
+            "gdrive": "google_drive",
+            "dropbox": "dropbox",
+            "box": "box",
+            "mega": "mega",
+        }
+        out = []
+        for s in sources:
+            k = (s or "").strip().lower()
+            v = m.get(k)
+            if v and v not in out:
+                out.append(v)
+        return out
+
     # ───────── request + session bootstrap ─────────
     user_email = getattr(current_user, "email", None)
     if not user_email:
         return jsonify(response="❌ Missing user context", intent="error"), 400
 
     payload              = request.json or {}
-    user_input           = (payload.get("message") or "").trim() if hasattr(str, "trim") else (payload.get("message") or "").strip()
+    user_input           = (payload.get("message") or "").strip()
     is_selection         = bool(payload.get("selectionStage"))
     selected_indices     = payload.get("selectedIndices")
     selected_ids_in      = payload.get("selectedFileIds") or []
     sources              = payload.get("sources") or []
-    attachments          = payload.get("attachments") or []           # <— upload chips from UI
+    attachments          = payload.get("attachments") or []           # upload chips from UI
     if not attachments and payload.get("upload_ids"):                 # back-compat: map ids -> minimal chips
         attachments = [{"id": i, "name": i, "path": i} for i in payload["upload_ids"] if i]
 
@@ -1005,11 +1173,43 @@ def chat():
         _save_ai(user_email, chat_id, first_turn, user_input, ai)
         return jsonify(response=ai, intent="calendar_create", chat_id=chat_id, meta=ans.get("meta", {}), done=ans.get("done", False))
 
-    # ───────── NEW: upload fast-paths ─────────
+    # ───────── Uploads & File Explain Routing ─────────
     UPLOAD_ROOT = current_app.config.get("UPLOAD_ROOT", os.path.join(current_app.root_path, "uploads"))
 
-    # If files are attached and the prompt refers to "this file" OR is an explain/summarize prompt -> summarize uploads directly
-    if attachments and (_wants_file_explain(user_input) or "this file" in (user_input or "").lower() or "attached" in (user_input or "").lower()):
+    def _resolve_local_from_attachment(att, upload_root):
+        p = (att.get("path") or "").strip()
+        if p and os.path.isabs(p) and os.path.exists(p):
+            return p
+        if p:
+            maybe = os.path.join(upload_root, p.lstrip("/\\"))
+            if os.path.exists(maybe): return maybe
+        u = (att.get("url") or "").strip()
+        if u.startswith("/uploads/"):
+            maybe = os.path.join(upload_root, u[len("/uploads/"):].lstrip("/\\"))
+            if os.path.exists(maybe): return maybe
+        return None
+
+    # Strict upload intent (no “this file” shortcut)
+    UPLOAD_INTENT_RX = re.compile(
+        r"\b(upload|save|store|put|send|push|sync|copy|move|add|publish|backup|back\s*up)\b",
+        re.I,
+    )
+
+    # Quick cancel
+    if user_input.lower() in {"cancel", "abort", "stop", "no"}:
+        try:
+            cancel_upload_flow(user_id=current_user.id)
+        except Exception:
+            pass
+        ai = "Ok, I have canceled your upload request."
+        _save_ai(user_email, chat_id, first_turn, user_input, ai)
+        return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+    ms_token_for_connlist = get_user_ms_token_or_none()
+    override_upload_list  = _upload_providers_from_sources(sources)
+
+    # ⭐ A) EXPLAIN FIRST: If files are attached and the user wants an explanation/summarization
+    if attachments and (_wants_file_explain(user_input) or "attached" in (user_input or "").lower()):
         try:
             res = summarize_uploads(
                 user_id=current_user.id,
@@ -1023,7 +1223,6 @@ def chat():
             ai = res.get("answer") or "I couldn't extract a useful answer from the uploaded file(s)."
             ai = _apply_if_user_response(ai, rules, "file_content")
             _save_ai(user_email, chat_id, first_turn, user_input, ai)
-            # remember selection so follow-ups like "now extract the emails" work
             _remember_selected_files(chat_id, res.get("selected") or [])
             session["stage"] = "awaiting_query"
             session["found_files"] = []
@@ -1031,7 +1230,121 @@ def chat():
         except Exception as e:
             current_app.logger.exception("upload summarization failed: %s", e)
 
-    # If picker is open and the user says "explain..." use current selection
+    # ⭐ B) If message carries files and CLEARLY asks to upload them (or empty text), start upload flow
+    if attachments and (UPLOAD_INTENT_RX.search(user_input or "") or not user_input):
+        res = start_best_upload_flow(
+            user_id=current_user.id,
+            attachments=attachments,
+            ms_token=ms_token_for_connlist,
+            user_text_hint=user_input,
+            connected_providers=override_upload_list or _connected_providers()
+        )
+        status = (res or {}).get("status")
+        if status in {"ask", "ask_folder", "ask_provider", "confirm"}:
+            ai = res.get("prompt", "Which folder should I upload to?")
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+        if status == "ready":
+            try:
+                from services_cloud_upload import perform_best_upload, provider_label
+                uploaded_map, errs = perform_best_upload(
+                    targets=res.get("targets", []),
+                    attachments=res.get("attachments", attachments),
+                    user_id=current_user.id,
+                    ms_token=ms_token_for_connlist,
+                    upload_root=UPLOAD_ROOT,
+                )
+                if uploaded_map:
+                    lines = []
+                    for p, items in uploaded_map.items():
+                        lines.append(f"**{provider_label(p)}**")
+                        for it in items:
+                            lines.append(f"• [{it['name']}]({it['webUrl']})" if it.get("webUrl") else f"• {it['name']}")
+                    ai = "✅ Uploaded:\n" + "\n".join(lines)
+                    if errs:
+                        ai += "\n\nSome items failed:\n" + "\n".join(f"- {e}" for e in errs)
+                else:
+                    ai = "❌ I couldn’t upload the file(s)."
+                    if errs:
+                        ai += "\n" + "\n".join(f"- {e}" for e in errs)
+            except Exception as e:
+                ai = f"Upload failed: {e}"
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            session["stage"] = "awaiting_query"
+            session["found_files"] = []
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+        if status in {"canceled", "error"}:
+            ai = res.get("prompt", "Ok, I have canceled your upload request." if status=="canceled" else "Sorry, I couldn't start the upload flow.")
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+    # ⭐ C) Only if an upload flow is already active do we pass the free-text into it
+    if is_upload_flow_active(current_user.id):
+        try:
+            flow_reply = handle_best_upload_reply(
+                user_id=current_user.id,
+                text=user_input,
+                ms_token=ms_token_for_connlist,
+                connected_providers=override_upload_list or _connected_providers(),
+            )
+        except Exception:
+            flow_reply = {}
+
+        if flow_reply.get("status") in {"ask", "ask_folder", "ask_provider", "confirm"}:
+            ai = flow_reply.get("prompt", "Which folder should I upload to?")
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+        if flow_reply.get("status") == "ready":
+            try:
+                from services_cloud_upload import perform_best_upload, provider_label
+                uploaded_map, errs = perform_best_upload(
+                    targets=flow_reply.get("targets", []),
+                    attachments=flow_reply.get("attachments") or attachments,
+                    user_id=current_user.id,
+                    ms_token=ms_token_for_connlist,
+                    upload_root=UPLOAD_ROOT,
+                )
+                if uploaded_map:
+                    lines = []
+                    for p, items in uploaded_map.items():
+                        lines.append(f"**{provider_label(p)}**")
+                        for it in items:
+                            lines.append(f"• [{it['name']}]({it['webUrl']})" if it.get("webUrl") else f"• {it['name']}")
+                    ai = "✅ Uploaded:\n" + "\n".join(lines)
+                    if errs:
+                        ai += "\n\nSome items failed:\n" + "\n".join(f"- {e}" for e in errs)
+                else:
+                    ai = "❌ I couldn’t upload the file(s)."
+                    if errs:
+                        ai += "\n" + "\n".join(f"- {e}" for e in errs)
+            except Exception as e:
+                ai = f"Upload failed: {e}"
+
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            session["stage"] = "awaiting_query"
+            session["found_files"] = []
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+        if flow_reply.get("status") == "canceled":
+            ai = flow_reply.get("prompt", "Ok, I have canceled your upload request.")
+            _save_ai(user_email, chat_id, first_turn, user_input, ai)
+            return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+    # ⭐ D) No files attached but the user said “upload …”
+    if (not attachments) and UPLOAD_INTENT_RX.search(user_input or ""):
+        res = start_best_upload_flow(
+            user_id=current_user.id,
+            attachments=[],                           # none yet; flow continues after attach
+            ms_token=ms_token_for_connlist,
+            user_text_hint=user_input,
+            connected_providers=override_upload_list or _connected_providers()
+        )
+        ai = (res or {}).get("prompt", "Where should I upload it?")
+        _save_ai(user_email, chat_id, first_turn, user_input, ai)
+        return jsonify(response=ai, intent="cloud_upload", chat_id=chat_id)
+
+    # ===== If picker is open and the user says "explain..." use current selection =====
     if session.get("stage") == "awaiting_selection" and user_input and _wants_file_explain(user_input):
         found = session.get("found_files", []) or []
         selected = _coerce_selected(found, selected_indices, selected_ids_in)
@@ -1081,7 +1394,7 @@ def chat():
         _save_ai(user_email, chat_id, first_turn, user_input, ai)
         return jsonify(response=ai, intent="file_content", chat_id=chat_id)
 
-    # ───────── intent routing ─────────
+    # ───────── intent routing (existing) ─────────
     try:
         det = detect_intent_and_extract(user_input or "")
     except Exception:
@@ -1256,7 +1569,7 @@ def chat():
             return jsonify(resp)
         return resp
 
-    # ===== Main LLM-first pipeline =====
+    # ===== Main LLM-first pipeline (unchanged) =====
     def _run_intent_pipeline():
         gpt_result = detect_intent_and_extract(user_input)
         intent2 = (gpt_result.get("intent") or "").lower()
@@ -1297,7 +1610,7 @@ def chat():
                 session["found_files"] = []
                 return jsonify(response=ai_up, intent="file_content", chat_id=chat_id)
 
-            # … else fall back to connector search + summarize (existing code path) …
+            # … connector search + summarize (existing code path) …
             search_str = " ".join(extracted_keywords[:8]) if extracted_keywords else (query or user_input)
 
             use_ms   = True if not sources else any(s in ("sharepoint", "onedrive") for s in sources)
@@ -1560,7 +1873,6 @@ def chat():
 
             if not all_hits:
                 ai = "📁 No files found."
-                # Do NOT apply rules (control prompt)
                 _save_ai(user_email, chat_id, first_turn, user_input, ai)
                 return jsonify(response=ai, intent="file_search", chat_id=chat_id)
 
@@ -1568,7 +1880,6 @@ def chat():
             session["found_files"] = all_hits
 
             ai = "Please select file (e.g., 1,3):"
-            # Do NOT apply rules to this structural UI message
             _save_ai(user_email, chat_id, first_turn, user_input, ai)
 
             per_page   = 5
@@ -2184,23 +2495,128 @@ def api_delete_upload():
 
 @app.route("/uploads/chat/<int:uid>/<chat_id>/<path:filename>")
 def serve_chat_upload(uid, chat_id, filename):
+    
     folder = os.path.join(UPLOAD_ROOT, str(uid), str(chat_id))
     return send_from_directory(folder, filename)
+
+# --- Auto-prune chat uploads --------------------------------------------------
+# Deletes files older than UPLOAD_MAX_AGE_SECONDS and keeps at most
+# UPLOAD_MAX_FILES files (globally under UPLOAD_ROOT). Oldest are removed first.
+
+UPLOAD_MAX_AGE_SECONDS = int(os.getenv("UPLOAD_MAX_AGE_SECONDS", "3600"))  # 1 hour
+UPLOAD_MAX_FILES       = int(os.getenv("UPLOAD_MAX_FILES", "10"))          # keep 10 newest
+_PRUNE_INTERVAL_SECONDS = 300  # sweep at most every 5 minutes per process
+_last_prune_ts = 0
+
+def _list_all_files(root: str) -> list[tuple[str, float]]:
+    """Return [(path, mtime)] for all files under root."""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for dirpath, _, filenames in os.walk(root, topdown=True):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            try:
+                out.append((fpath, os.path.getmtime(fpath)))
+            except Exception:
+                continue
+    return out
+
+def _tidy_empty_dirs(root: str) -> None:
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        try:
+            if not dirnames and not filenames:
+                os.rmdir(dirpath)
+        except Exception:
+            pass
+
+def _prune_old_uploads(
+    root: str,
+    max_age: int = UPLOAD_MAX_AGE_SECONDS,
+    max_files: int = UPLOAD_MAX_FILES,
+) -> int:
+    """
+    Walk UPLOAD_ROOT, delete files older than max_age (seconds),
+    then enforce max_files by deleting the oldest until the cap is met.
+    Returns number of files removed.
+    """
+    removed = 0
+    now = time.time()
+    files = _list_all_files(root)
+
+    # 1) Age-based deletions
+    for fpath, mtime in files:
+        try:
+            if now - mtime > max_age:
+                os.remove(fpath)
+                removed += 1
+        except Exception:
+            pass
+
+    # Re-enumerate after age pass
+    files = _list_all_files(root)
+
+    # 2) Capacity-based deletions (keep newest)
+    if max_files > 0 and len(files) > max_files:
+        # sort by mtime newest → oldest, then drop the tail
+        files_sorted = sorted(files, key=lambda t: t[1], reverse=True)
+        to_delete = files_sorted[max_files:]
+        for fpath, _ in to_delete:
+            try:
+                os.remove(fpath)
+                removed += 1
+            except Exception:
+                pass
+
+    # 3) Tidy empty directories
+    _tidy_empty_dirs(root)
+    return removed
+
+@app.before_request
+def _maybe_prune_uploads():
+    global _last_prune_ts
+    now = time.time()
+    if now - _last_prune_ts < _PRUNE_INTERVAL_SECONDS:
+        return
+    _last_prune_ts = now
+    try:
+        count = _prune_old_uploads(UPLOAD_ROOT, UPLOAD_MAX_AGE_SECONDS, UPLOAD_MAX_FILES)
+        if count:
+            current_app.logger.info(f"🧹 Pruned {count} upload(s).")
+    except Exception:
+        current_app.logger.exception("Upload prune failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPA routes (serve React index.html so refresh works)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/superadmin")
+@app.route("/superadmin/<path:subpath>")
+def spa_superadmin(subpath=None):
+    return send_from_directory(app.static_folder, "index.html")
+
+@app.route("/staff/login")
+def spa_staff_login():
+    return send_from_directory(app.static_folder, "index.html")
+
 @app.route("/login")
 @app.route("/signup")
 @app.route("/dashboard")
 @app.route("/admin")
 @app.route("/admin/upload")
-@app.route("/trial-ended")  # route the SPA will render as the “trial ended” page
+@app.route("/trial-ended")
+@app.route("/pricing")
+@app.route("/workspace")
 def spa_routes():
     return send_from_directory(app.static_folder, "index.html")
 
-# Static serving & catch-all
+@app.route("/workspace/accept")
+def spa_workspace_accept():
+    return send_from_directory(app.static_folder, "index.html")
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_react(path):
@@ -2209,6 +2625,6 @@ def serve_react(path):
         return send_from_directory(app.static_folder, path)
     return send_from_directory(app.static_folder, "index.html")
 
-# 🏁 Startup
+# Startup Flask app
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="localhost", port=5000)

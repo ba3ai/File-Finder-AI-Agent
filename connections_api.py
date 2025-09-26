@@ -32,6 +32,12 @@ def _make_state(uid: int) -> str:
 def _parse_state(state: str) -> dict:
     return _serializer().loads(state)
 
+def _require(val: str | None, name: str) -> str:
+    """Fail fast if a critical env/config value is missing."""
+    if not val:
+        raise RuntimeError(f"{name} is not set. Put it in your environment AND in the provider console exactly.")
+    return val
+
 # Microsoft redirect (computed from PUBLIC_BASE_URL)
 MS_REDIRECT_PATH = "/api/connections/microsoft/callback"
 MS_REDIRECT_URI  = f"{PUBLIC_BASE_URL}{MS_REDIRECT_PATH}"
@@ -242,6 +248,7 @@ def microsoft_callback():
     access_token = token_result["access_token"]
     refresh_token = token_result.get("refresh_token")
     expires_in = int(token_result.get("expires_in", 3600))
+    # Keep ISO here (your MS helpers already handle ISO fine)
     expires_at = (datetime.utcnow() + timedelta(seconds=max(expires_in - 60, 0))).isoformat()
 
     # Email from id token claims (MSAL adds 'openid' internally)
@@ -266,7 +273,7 @@ def microsoft_disconnect(provider):
     return _json({"message": "Microsoft disconnected"})
 
 # =============================================================================
-# Google Drive OAuth (read-only) + Gmail + Calendar
+# Google Drive OAuth (Drive + Gmail + Calendar)
 # =============================================================================
 def _google_client_config():
     client_id = os.getenv("GOOGLE_CLIENT_ID")
@@ -282,17 +289,23 @@ def _google_client_config():
     }
 
 # Request Drive + Gmail + Calendar in one Google consent
-GOOGLE_SCOPES = (
-    "openid email profile "
-    "https://www.googleapis.com/auth/drive.readonly "
-    "https://www.googleapis.com/auth/gmail.readonly "
-    "https://www.googleapis.com/auth/calendar.readonly"
-)
+GOOGLE_SCOPES_LIST = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive.file",
+]
+GOOGLE_SCOPES = " ".join(GOOGLE_SCOPES_LIST)
 
 @connections_bp.route("/google/authurl", methods=["GET"])
 @login_required
 def google_authurl():
     cfg = _google_client_config()
+    _require(GOOGLE_REDIRECT_URI, "GOOGLE_REDIRECT_URI")
     state = _make_state(current_user.id)
     _set_pref(current_user.id, GOOGLE_OAUTH_STATE, state)
     params = {
@@ -333,7 +346,7 @@ def google_callback():
             "code": code,
             "client_id": cfg["client_id"],
             "client_secret": cfg["client_secret"],
-            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "redirect_uri": _require(GOOGLE_REDIRECT_URI, "GOOGLE_REDIRECT_URI"),
             "grant_type": "authorization_code",
         },
         timeout=30,
@@ -345,7 +358,9 @@ def google_callback():
     access_token  = tok.get("access_token")
     refresh_token = tok.get("refresh_token")   # may be None on re-consent
     expires_in    = int(tok.get("expires_in", 0))
-    exp_ts        = int(time.time()) + expires_in if expires_in else 0
+
+    # ✅ Store EPOCH seconds to match google_drive_api helpers
+    exp_epoch = int(time.time()) + max(expires_in - 60, 0)
 
     # Fetch profile (email) for “Connected as …”
     email = None
@@ -363,8 +378,7 @@ def google_callback():
     _set_pref(uid, GOOGLE_ACCESS_TOKEN, access_token)
     if refresh_token:
         _set_pref(uid, GOOGLE_REFRESH_TOKEN, refresh_token)
-    if exp_ts:
-        _set_pref(uid, GOOGLE_EXPIRES_AT, str(exp_ts))
+    _set_pref(uid, GOOGLE_EXPIRES_AT, str(exp_epoch))
     if email:
         _set_pref(uid, GOOGLE_ACCOUNT_EMAIL, email)
 
@@ -402,13 +416,16 @@ def _dbx_client_config():
         "client_secret": csec,
         "auth_uri": "https://www.dropbox.com/oauth2/authorize",
         "token_uri": "https://api.dropboxapi.com/oauth2/token",
-        "redirect_uri": DROPBOX_REDIRECT_URI,
+        "redirect_uri": _require(DROPBOX_REDIRECT_URI, "DROPBOX_REDIRECT_URI"),
         "userinfo": "https://api.dropboxapi.com/2/users/get_current_account",
         "revoke": "https://api.dropboxapi.com/2/auth/token/revoke",
     }
 
-# Minimum scopes for listing/searching metadata + account email + temp links
-DBX_SCOPES = "files.metadata.read account_info.read files.content.read"
+# Minimum scopes for listing/searching metadata + account email + WRITE
+DBX_SCOPES = os.getenv(
+    "DBX_SCOPES",
+    "files.metadata.read files.content.read account_info.read files.content.write"
+).split()
 
 @connections_bp.route("/dropbox/authurl", methods=["GET"])
 @login_required
@@ -421,7 +438,7 @@ def dropbox_authurl():
         "redirect_uri": cfg["redirect_uri"],
         "response_type": "code",
         "token_access_type": "offline",  # refresh_token
-        "scope": DBX_SCOPES,
+        "scope": " ".join(DBX_SCOPES),   # Dropbox expects a space-separated string
         "state": state,
     }
     url = cfg["auth_uri"] + "?" + urlencode(params)
@@ -464,7 +481,9 @@ def dropbox_callback():
     access_token  = t.get("access_token")
     refresh_token = t.get("refresh_token")
     expires_in    = int(t.get("expires_in", 0))
-    exp_ts        = int(time.time()) + expires_in if expires_in else 0
+
+    # ✅ Store EPOCH seconds to match dropbox_api helpers
+    exp_epoch = int(time.time()) + max(expires_in - 60, 0)
 
     # Get account info for “Connected as …”
     email = None
@@ -482,8 +501,7 @@ def dropbox_callback():
     _set_pref(uid, DBX_ACCESS_TOKEN, access_token)
     if refresh_token:
         _set_pref(uid, DBX_REFRESH_TOKEN, refresh_token)
-    if exp_ts:
-        _set_pref(uid, DBX_EXPIRES_AT, str(exp_ts))
+    _set_pref(uid, DBX_EXPIRES_AT, str(exp_epoch))
     if email:
         _set_pref(uid, DBX_ACCOUNT_EMAIL, email)
 
@@ -598,7 +616,7 @@ def box_disconnect():
         _del_pref(uid, k)
     return _json({"message": "Box disconnected"})
 
-# ── MEGA routes (session-only, named endpoints to avoid collisions)
+# ── MEGA routes (session-only)
 @connections_bp.route("/mega/connect", methods=["POST"], endpoint="mega_connect_api")
 @login_required
 def mega_connect_api():
@@ -789,6 +807,7 @@ def connect_all():
         }
 
     cfg = _google_client_config()
+    _require(GOOGLE_REDIRECT_URI, "GOOGLE_REDIRECT_URI")
     state = _make_state(current_user.id)
     _set_pref(current_user.id, GOOGLE_OAUTH_STATE, state)
     params = {

@@ -1,9 +1,15 @@
 // src/components/ChatPanel.jsx
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import ChatBubble from "./ChatBubble";
+import AskGPT from "./AskGPT";
+import SelectionAskButton from "./SelectionAskButton";
 
 // ChatInput fires this right before it sends a normal message
 const RESUME_EVENT = "file-select:ensure-resumed";
+
+// Lightweight bridge events so we don't tightly couple to ChatInput.jsx
+const EVT_INSERT = "chat:insert-text"; // detail: { text }
+const EVT_SEND = "chat:send-text";     // detail: { text }
 
 /** Optional helper for /api/chats (used by the quick switcher) */
 async function apiGet(url) {
@@ -45,7 +51,9 @@ function ChatSwitcher({ onSelectChat, onNewChat }) {
         className="fixed bottom-24 right-6 z-30 w-12 h-12 rounded-full bg-[#E0C389] text-[#1b1720] shadow-xl grid place-items-center hover:brightness-95"
         onClick={() => setOpen(true)}
       >
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v12H7l-3 3V4z"/></svg>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M4 4h16v12H7l-3 3V4z" />
+        </svg>
       </button>
 
       {open && (
@@ -98,8 +106,8 @@ function ChatSwitcher({ onSelectChat, onNewChat }) {
 export default function ChatPanel({
   messages,
   fileOptions,
-  allFiles,
-  pauseGPT,                 // true when the file picker should be shown
+  allFiles,                  // (kept for compatibility)
+  pauseGPT,                  // true => show file selection stage
   toggleSelectFile,
   selectedFiles = [],
   sendSelectedFiles,
@@ -107,56 +115,74 @@ export default function ChatPanel({
   totalFiles,
   onPageChange,
   onFilterChange,
-  onSkipFileSelection,      // collapses the picker
+  onSkipFileSelection,       // collapses the picker
   availableFileTypes,
   onSelectChat,
   onNewChat,
   userAvatarUrl,
-  summarizeSelectedFiles,   // (selectedFiles) => Promise<void>  – parent handles POST + assistant bubble
-  onUserMessage,            // (text, attachments?) => void     – parent appends user bubble locally
+  summarizeSelectedFiles,    // (selectedFiles) => Promise<void>
+  onUserMessage,             // (text, attachments?) => void
 }) {
-  const [busySummarize, setBusySummarize] = useState(false);
   const chatEndRef = useRef(null);
+  const [busySummarize, setBusySummarize] = useState(false);
 
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, fileOptions, pauseGPT]);
-
-  // Close the picker when ChatInput sends a normal message
   useEffect(() => {
-    const handler = () => { if (pauseGPT && typeof onSkipFileSelection === "function") onSkipFileSelection(); };
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, fileOptions, pauseGPT]);
+
+  // Allow ChatInput to close the picker before a normal send
+  useEffect(() => {
+    const handler = () => {
+      if (pauseGPT && typeof onSkipFileSelection === "function") {
+        onSkipFileSelection();
+      }
+    };
     window.addEventListener(RESUME_EVENT, handler);
     return () => window.removeEventListener(RESUME_EVENT, handler);
   }, [pauseGPT, onSkipFileSelection]);
 
-  const getFileTypes = () => availableFileTypes || [];
+  // Build LLM history for AskGPT (last 8 turns)
+  const askHistory = useMemo(() => {
+    return (messages || []).slice(-8).map((m) => ({
+      role: m?.sender === "user" ? "user" : "assistant",
+      content: m?.message || "",
+    }));
+  }, [messages]);
+
+  // Emitters to talk to ChatInput without direct imports
+  const emitInsert = (text) => {
+    window.dispatchEvent(new CustomEvent(EVT_INSERT, { detail: { text } }));
+  };
+  const emitSend = (text) => {
+    window.dispatchEvent(new Event(RESUME_EVENT)); // ensure picker is closed
+    window.dispatchEvent(new CustomEvent(EVT_SEND, { detail: { text } }));
+  };
+
   const isChecked = (id) => selectedFiles?.some((f) => f.id === id);
 
   const handleSummarize = async () => {
-    if (busySummarize) return;
-    if (!selectedFiles || selectedFiles.length === 0) return;
+    if (busySummarize || !selectedFiles?.length) return;
 
     setBusySummarize(true);
 
-    // 1) Append a user bubble locally (no server fetch here)
+    // Local echo (optional)
     const text = "Summarize this file";
-    if (typeof onUserMessage === "function") {
-      onUserMessage(text);
-    } else {
-      // Fallback, only if your app uses events to append
-      window.dispatchEvent(new CustomEvent("chat:append-user", { detail: { text } }));
-    }
+    if (typeof onUserMessage === "function") onUserMessage(text);
+    else window.dispatchEvent(new CustomEvent("chat:append-user", { detail: { text } }));
 
-    // 2) Run summarization
     try {
       if (typeof summarizeSelectedFiles === "function") {
-        await summarizeSelectedFiles(selectedFiles); // Parent will append the AI message
+        await summarizeSelectedFiles(selectedFiles);
       } else {
-        // Fallback direct call (optional)
-        const body = { selectedIds: (selectedFiles || []).map((f) => f.id), prompt: text };
+        // Fallback behavior if parent didn't pass a handler
         const res = await fetch("/api/summarize_selected", {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({
+            selectedIds: selectedFiles.map((f) => f.id),
+            prompt: text,
+          }),
         });
         const data = await res.json();
         const ai = data?.response || "⚠️ Summarization failed.";
@@ -166,35 +192,39 @@ export default function ChatPanel({
       console.error("Summarize failed:", e);
       window.dispatchEvent(new CustomEvent("chat:append-assistant", { detail: { text: "⚠️ Summarization failed." } }));
     } finally {
-      // 3) Collapse the picker and resume input
       if (typeof onSkipFileSelection === "function") onSkipFileSelection();
       window.dispatchEvent(new Event(RESUME_EVENT));
       setBusySummarize(false);
     }
   };
 
+  const totalPages = Math.max(1, Math.ceil((totalFiles || 0) / 5));
+
   return (
     <div className="w-full max-w-[980px] mx-auto p-4 space-y-4">
       <ChatSwitcher onSelectChat={onSelectChat} onNewChat={onNewChat} />
 
-      {messages?.map((msg, i) => (
-        <ChatBubble
-          key={i}
-          sender={msg.sender}
-          message={msg.message}
-          isStatus={msg.isStatus}
-          statusType={msg.statusType}
-          timestamp={msg.timestamp}
-          userAvatarUrl={userAvatarUrl}
-          sources={msg.sources}
-          // IMPORTANT: render from `attachments`
-          attachments={msg.attachments || msg.files || []}
-        />
-      ))}
+      {/* Transcript wrapper — used by SelectionAskButton to scope selections */}
+      <div id="chat-transcript">
+        {messages?.map((msg, i) => (
+          <ChatBubble
+            key={i}
+            sender={msg.sender}
+            message={msg.message}
+            isStatus={msg.isStatus}
+            statusType={msg.statusType}
+            timestamp={msg.timestamp}
+            userAvatarUrl={userAvatarUrl}
+            sources={msg.sources}
+            // IMPORTANT: render from `attachments`
+            attachments={msg.attachments || msg.files || []}
+          />
+        ))}
+      </div>
 
       <div ref={chatEndRef} />
 
-      {/* Selection stage UI */}
+      {/* File selection stage */}
       {pauseGPT && (
         <div className="bg-[#171717] p-6 rounded-2xl shadow-md border border-[#22345e] space-y-4 w-full">
           <h2 className="text-white text-xl font-semibold mb-2">📂 Files I Found for You</h2>
@@ -204,11 +234,11 @@ export default function ChatPanel({
             <label className="text-sm text-white mr-2">Filter:</label>
             <select
               className="text-sm bg-[#182544] text-white px-2 py-1 rounded border border-[#22345e]"
-              onChange={(e) => onFilterChange(e.target.value)}
+              onChange={(e) => onFilterChange?.(e.target.value)}
               defaultValue=""
             >
               <option value="">All</option>
-              {getFileTypes().map((ext) => (
+              {(availableFileTypes || []).map((ext) => (
                 <option key={ext} value={ext}>
                   {ext.toUpperCase().replace(".", "")}
                 </option>
@@ -223,7 +253,7 @@ export default function ChatPanel({
                 <div
                   key={file.id}
                   className="bg-[#182544] rounded-lg p-4 hover:bg-[#1d2a51] transition-colors cursor-pointer border border-[#22345e]"
-                  onClick={() => toggleSelectFile(file)}
+                  onClick={() => toggleSelectFile?.(file)}
                 >
                   <div className="flex justify-between items-center mb-2">
                     <h3 className="text-white font-medium text-base">
@@ -268,24 +298,24 @@ export default function ChatPanel({
                   ? "bg-[#1d2a51] text-white/50 cursor-not-allowed"
                   : "bg-[#BD945B] text-black hover:bg-[#a17d4b]"
               }`}
-              onClick={() => onPageChange(page - 1)}
+              onClick={() => onPageChange?.(page - 1)}
               disabled={page === 1}
             >
               ← Previous
             </button>
 
             <span className="text-white/80 text-sm">
-              Page {page} of {Math.max(1, Math.ceil((totalFiles || 0) / 5))}
+              Page {page} of {totalPages}
             </span>
 
             <button
               className={`text-sm font-medium py-2 px-4 rounded-lg transition ${
-                page >= Math.max(1, Math.ceil((totalFiles || 0) / 5))
+                page >= totalPages
                   ? "bg-[#1d2a51] text-white/50 cursor-not-allowed"
                   : "bg-[#BD945B] text-black hover:bg-[#a17d4b]"
               }`}
-              onClick={() => onPageChange(page + 1)}
-              disabled={page >= Math.max(1, Math.ceil((totalFiles || 0) / 5))}
+              onClick={() => onPageChange?.(page + 1)}
+              disabled={page >= totalPages}
             >
               Next →
             </button>
@@ -304,7 +334,7 @@ export default function ChatPanel({
             Send Selected Files
           </button>
 
-          {/* Summarize files – follows chat flow */}
+          {/* Summarize files */}
           <button
             className={`w-full mt-2 py-2 px-4 text-white font-semibold rounded-lg shadow-md transition ${
               selectedFiles.length > 0 && !busySummarize
@@ -323,6 +353,20 @@ export default function ChatPanel({
           </p>
         </div>
       )}
+
+      {/* Floating “Ask GPT” button for text selections inside the transcript */}
+      <SelectionAskButton containerSelector="#chat-transcript" />
+
+      {/* Sticky AskGPT suggestion strip above the composer */}
+      <div className="sticky bottom-0 pt-1 bg-gradient-to-t from-[#0b1022] via-[#0b1022] to-transparent">
+        <AskGPT
+          history={askHistory}
+          onInsert={(t) => emitInsert(t)}
+          onSend={(t) => emitSend(t)}
+          endpoint={"/askgpt/suggestions"}
+          compact={false}
+        />
+      </div>
     </div>
   );
 }

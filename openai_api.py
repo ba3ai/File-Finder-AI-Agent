@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover
     ChatOllama = None  # type: ignore
 
 MODEL_NAME       = os.getenv("OLLAMA_MODEL", "qwen2:7b")
-NUM_CTX          = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+NUM_CTX          = int(os.getenv("OLLAMA_NUM_CTX", "20000"))
 NUM_PREDICT      = int(os.getenv("OLLAMA_NUM_PREDICT", "800"))
 LLM_TEMPERATURE  = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 DEBUG            = bool(int(os.getenv("OPENAI_API_DEBUG", "0")))
@@ -37,13 +37,23 @@ def _dprint(*args, **kwargs):
 _WHITESPACE_RE = re.compile(r"\s+")
 _PUNCT_GUARD = str.maketrans({c: " " for c in string.punctuation if c not in {'"', "'", "-", "_", ".", "@", "#"}})
 
+# Expanded stopwords; all lower-case keys (we compare in lower).
 STOPWORDS = {
-    "a","an","the","and","or","but","if","then","else","when","what","which","who","whom","whose","where",
+    "a","an","am","the","and","or","but","if","then","else","when","what","which","who","whom","whose","where",
     "why","how","to","for","of","in","on","at","by","with","from","as","is","are","was","were","be","been","being",
     "this","that","these","those","i","you","he","she","it","we","they","me","him","her","them","my","your","our",
     "their","mine","yours","ours","theirs","do","does","did","doing","done","can","could","should","would","will",
     "shall","may","might","must","not","no","yes","please","kindly","show","give","find","open","need","want","see",
     "about","regarding","related","latest","recent","new","ready","user","request","result","results",
+    # generic “file-y” words (we also strip as suffixes, but include here for singles)
+    "file","files","document","documents","doc","docs","pdf","ppt","pptx","xls","xlsx","sheet","sheets",
+}
+
+# Generic suffixes that should be removed from the END of phrases/keywords
+_GENERIC_SUFFIXES = {
+    "file","files","document","documents","doc","docs","pdf","ppt","pptx","xls","xlsx","csv",
+    "sheet","sheets","image","images","photo","photos","pic","pics","jpeg","jpg","png","txt",
+    "most","recent","latest"  # handles ends like "... latest"
 }
 
 def _normalize_space(s: str) -> str:
@@ -78,6 +88,33 @@ def _split_phrases_and_tokens(text: str) -> List[str]:
     tokens = [t.strip() for t in remainder.split()]
     return [t for t in (phrases + tokens) if t]
 
+def _strip_generic_suffixes_from_phrase(p: str) -> str:
+    parts = p.split()
+    # Keep removing if trailing word is a generic suffix
+    while parts and parts[-1].lower().strip(string.punctuation) in _GENERIC_SUFFIXES:
+        parts.pop()
+    return " ".join(parts)
+
+def _clean_keywords_suffixes(s: str) -> str:
+    """Clean a keywords string (space- or comma-joined) by removing generic trailing words."""
+    if not s:
+        return s
+    if "," in s:
+        items = [i.strip() for i in s.split(",")]
+        cleaned = [_strip_generic_suffixes_from_phrase(i) for i in items]
+        cleaned = [c for c in cleaned if c]
+        # dedupe preserving order (case-insensitive)
+        out, seen = [], set()
+        for c in cleaned:
+            k = c.lower()
+            if k and k not in seen:
+                seen.add(k); out.append(c)
+        return ", ".join(out)
+    else:
+        # treat entire string as a phrase (e.g., "custom ai agent file")
+        cleaned = _strip_generic_suffixes_from_phrase(s)
+        return cleaned.strip()
+
 def _rule_keywords(text: str, max_terms: int = 8) -> str:
     if not text: return ""
     all_terms = _split_phrases_and_tokens(text)
@@ -94,7 +131,8 @@ def _rule_keywords(text: str, max_terms: int = 8) -> str:
         if len(low) == 1 and not low.isdigit(): continue
         cleaned.append(low)
     cleaned = _dedup_preserve_order(cleaned)
-    return " ".join(cleaned[:max_terms])
+    out = " ".join(cleaned[:max_terms])
+    return _clean_keywords_suffixes(out)
 
 # ------------- time helpers -------------
 def _tz() -> timezone:
@@ -186,11 +224,39 @@ def _llm_respond(prompt: str) -> str:
             _dprint("LLM fallback error:", e2)
             return ""
 
+# PUBLIC: minimal wrapper for system+user prompts (used by Ask-GPT endpoints)
+def call_chat_model(system: str, user: str, temperature: float = 0.0, json_mode: bool = False) -> Any:
+    """
+    Calls the configured Ollama chat model with a simple `system:` + `user:` prompt.
+    If json_mode=True, tries to return a parsed JSON object; otherwise returns string text.
+    """
+    if _llm is None:
+        return {} if json_mode else ""
+    prompt = f"system: {system}\nuser: {user}"
+    try:
+        out = _llm.invoke(prompt)
+        text = getattr(out, "content", None) or str(out) or ""
+    except Exception:
+        try:
+            text = _llm.predict(prompt) or ""
+        except Exception:
+            text = ""
+    text = text.strip()
+    if json_mode:
+        parsed = _json_from_text(text)
+        if parsed is not None:
+            return parsed
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    return text
+
 # ------------- INTENT SYSTEM (JSON) -------------
 _INTENT_SYSTEM_JSON = (
     "You are an intent router. Return STRICT JSON only.\n"
     "Schema:{"
-    "\"intent\":\"send_email|email_search|calendar_create|calendar_search|file_search|file_content|web_search|message_search|hr_admin|general\","
+    "\"intent\":\"send_email|email_search|calendar_create|calendar_search|file_search|file_content|web_search|message_search|hr_admin|cloud_upload|general\","
     "\"confidence\":0.0-1.0,"
     "\"keywords\":[\"...\"],"
     "\"extracted_keywords\":[\"...\"],"
@@ -198,17 +264,22 @@ _INTENT_SYSTEM_JSON = (
     "\"time_min_iso\":\"YYYY-MM-DDTHH:MM:SSZ|null\","
     "\"time_max_iso\":\"YYYY-MM-DDTHH:MM:SSZ|null\"}\n"
     "Routing notes:\n"
+    "- cloud_upload is for placing/adding the (attached/selected) file(s) into cloud storage like SharePoint, OneDrive, Google Drive, Dropbox, Box, or MEGA. "
+    "Typical verbs: upload, save, store, put, send, push, sync, copy, move, add, publish, back up; prepositions: to/on/into/in.\n"
     "- send_email is for composing/sending an email (collect recipient, subject, body, then confirm).\n"
     "- calendar_create is for scheduling a new event/meeting (title, time, attendees, etc.).\n"
     "- message_search is for Slack/Teams chats/channels/DMs (#channel, @user, workspace).\n"
     "- email_search is for Gmail/Outlook email inbox.\n"
-    "- file_search is to find/list files; file_content is to read/summarize a specific file.\n"
+    "- file_search is to find/list files; file_content is to read/summarize a specific file. "
+    "Extract the main search keyword(s) only. Remove generic suffix words like "
+    "'file','files','document','documents','pdf','doc','docx','xls','xlsx','csv','ppt','pptx','sheet','sheets', "
+    "'most','recent','latest' from the end of phrases.\n"
     "- web_search is for live/online facts (news, weather, prices, who/what queries).\n"
     "- hr_admin for HR/policy/leave/payroll questions.\n"
     "Time rules:\n"
     "- Do NOT convert relative time (today/this week/last month) to absolute; leave as null.\n"
     "- Only set time_* when the user gave explicit absolute dates.\n"
-    "Keywords: 1–8 short tokens (preserve quoted phrases); extracted_keywords should equal keywords.\n"
+    "Keywords: return 1–8 short key phrases (preserve quoted phrases). Avoid filler like 'I want', 'please', etc.\n"
     "Confidence: >=0.7 when clearly matched; otherwise lower.\n"
 )
 
@@ -231,6 +302,26 @@ _TO_EMAIL_RX  = re.compile(r"\bto\s+([A-Za-z0-9_.+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-
 _CAL_CREATE_VERBS = {"create","schedule","set up","setup","book","add","arrange","organize","organise","plan"}
 _CAL_CREATE_NOUNS = {"meeting","event","appointment","call","sync","catchup","catch-up","demo","review","standup","stand-up","session"}
 
+# Cloud upload lexicon (NEW)
+_UPLOAD_VERBS = {"upload","save","store","put","send","push","sync","copy","move","add","publish","backup","back up","back-up"}
+_UPLOAD_PREP  = {"to","on","into","in"}
+_PROVIDER_HINTS = {
+    "sharepoint": "sharepoint",
+    "one drive": "onedrive",
+    "onedrive": "onedrive",
+    "google drive": "google_drive",
+    "gdrive": "google_drive",
+    "dropbox": "dropbox",
+    "box": "box",
+    "mega": "mega",
+    # keep existing mail/chat hints as well
+    "gmail": "gmail",
+    "outlook": "outlook",
+    "teams": "teams",
+    "microsoft teams": "teams",
+    "slack": "slack",
+}
+
 def _score_intents(text: str) -> Tuple[str, float, Dict[str, Any]]:
     low = (text or "").lower()
 
@@ -238,18 +329,25 @@ def _score_intents(text: str) -> Tuple[str, float, Dict[str, Any]]:
     channels = re.findall(r"#([a-z0-9_\-]+)", low)
     people   = re.findall(r"@([a-z0-9_\.\-]+)", low)
     provider_hint = None
-    if "slack" in low or channels or ("workspace" in low and "teams" not in low):
-        provider_hint = "slack"
-    elif "teams" in low or "microsoft teams" in low:
-        provider_hint = "teams"
-    elif "gmail" in low:
-        provider_hint = "gmail"
-    elif "outlook" in low:
-        provider_hint = "outlook"
+    for k, v in _PROVIDER_HINTS.items():
+        if k in low:
+            provider_hint = v
+            break
 
     def has_any(words): return any(w in low for w in words)
     def weight(*pairs):
         return sum(w for cond, w in pairs if cond)
+
+    # ---- cloud_upload (NEW)
+    has_upload_verb = any(v in low for v in _UPLOAD_VERBS)
+    has_upload_prep = any(p in low for p in _UPLOAD_PREP)
+    mentions_provider = provider_hint in {"sharepoint","onedrive","google_drive","dropbox","box","mega"} or ("drive" in low and "slack" not in low)
+    mentions_file_context = ("this file" in low) or ("attached" in low) or ("attachment" in low) or ("attachments" in low)
+    s_upload = weight(
+        (has_upload_verb and mentions_provider, 0.7),
+        (has_upload_prep,                        0.15),
+        (mentions_file_context,                  0.15),
+    )
 
     # send_email (compose/send flow)
     has_send_verb   = has_any(_SEND_VERBS)
@@ -275,7 +373,7 @@ def _score_intents(text: str) -> Tuple[str, float, Dict[str, Any]]:
     s_email = weight(
         (has_any(_EMAIL_WORDS),              0.6),
         ("inbox" in low,                     0.2),
-        ("email" in low and not provider_hint, 0.1),
+        ("email" in low and provider_hint not in {"gmail","outlook"}, 0.1),
     )
 
     # file_search vs file_content
@@ -318,6 +416,7 @@ def _score_intents(text: str) -> Tuple[str, float, Dict[str, Any]]:
     s_hr = weight((has_any(_HR_WORDS), 0.7))
 
     scored = [
+        ("cloud_upload",     s_upload),
         ("send_email",       s_send),
         ("message_search",   s_msg),
         ("email_search",     s_email),
@@ -354,7 +453,7 @@ def detect_intent_and_extract(user_input: str) -> Dict[str, Any]:
         "time_min_iso": str|None,
         "time_max_iso": str|None,
         # NEW (safe to ignore by existing code):
-        "provider_hint": "slack|teams|gmail|outlook|drive|sharepoint|web|None",
+        "provider_hint": "slack|teams|gmail|outlook|sharepoint|onedrive|google_drive|dropbox|box|mega|None",
         "channels": ["#finance", ...],
         "people": ["@alice", ...],
       }
@@ -373,18 +472,28 @@ def detect_intent_and_extract(user_input: str) -> Dict[str, Any]:
     confidence = float(parsed.get("confidence", 0.0) or 0.0)
     kw_list = parsed.get("keywords") or []
     if not isinstance(kw_list, list): kw_list = []
-    kw = " ".join([str(k).strip() for k in kw_list if isinstance(k,str)])
+    # join the model's keywords and then clean suffixes
+    kw_joined = " ".join([str(k).strip() for k in kw_list if isinstance(k, str)])
+    kw = _clean_keywords_suffixes(kw_joined)
 
     # 3) Our deterministic scorer (wins if LLM is low/uncertain)
     h_intent, h_score, extras = _score_intents(ui)
-    if intent not in {"send_email","email_search","calendar_create","calendar_search","file_search","file_content","web_search","message_search","hr_admin","general"}:
+    allowed = {"send_email","email_search","calendar_create","calendar_search","file_search","file_content","web_search","message_search","hr_admin","cloud_upload","general"}
+    if intent not in allowed:
         intent, confidence = h_intent, max(0.55, h_score)
     else:
+        # Prefer strong heuristic when it’s clearly more confident (esp. for uploads)
         if h_score >= (confidence + 0.15):
             intent, confidence = h_intent, h_score
+        # If heuristic says cloud_upload with high certainty, prefer it
+        if h_intent == "cloud_upload" and h_score >= max(confidence + 0.15, 0.65):
+            intent, confidence = "cloud_upload", max(h_score, 0.75)
 
-    # 4) Keywords
+    # 4) Keywords (LLM → cleaned → fallback)
     data = _normalize_space(kw) or _rule_keywords(ui)
+    data = _clean_keywords_suffixes(data)
+    if not data:
+        data = _clean_keywords_suffixes(_rule_keywords(ui))
 
     # 5) Time window (relative parser takes precedence)
     tmin, tmax = _parse_window_local(ui)
@@ -414,6 +523,7 @@ def detect_intent_and_extract(user_input: str) -> Dict[str, Any]:
 def extract_keywords(user_input: str, max_terms: int = 8) -> str:
     res = detect_intent_and_extract(user_input)
     data = res.get("data") or _rule_keywords(user_input, max_terms=max_terms)
+    data = _clean_keywords_suffixes(data)
     return " ".join(str(data).split()[:max_terms])
 
 # ------------- Chat-flow rules (unchanged API) -------------
@@ -484,7 +594,7 @@ def answer_general_query(
     sys_msg = _system_prompt_from_rules(base_sys, chat_rules)
     convo = [f"system: {sys_msg}"]
     if history:
-        for m in history[-6:]:
+        for m in history[-6:] :
             role = m.get("role","user"); content = m.get("content","")
             convo.append(f"{role}: {content}")
     convo.append(f"user: {user_input}")
@@ -506,15 +616,16 @@ def answere_general_query(*args, **kwargs):
 
 if __name__ == "__main__":
     samples = [
-        "send an email to john@acme.com about the Q2 report",
+        "upload this file on SharePoint in Shared Documents/General",
+        "please save the attachment to Google Drive /Reports/2025",
+        "explain this file",
+        "find the proposal deck about alpha launch",
         "schedule a 45-min meeting with sara@acme.com on Thursday at 3pm",
-        "search slack #finance for pike valuation last week",
         "show my inbox today",
         "what meetings do I have next week",
-        "summarize the Q2 board deck PDF",
-        "find p&l 2024 xlsx in drive",
-        "what is the latest USD rate today",
+        "search Teams for our chat about OKRs",
         "from now on answer in 3 words",
+        "I want custom ai agent file",
     ]
     rules = {}
     for t in samples:

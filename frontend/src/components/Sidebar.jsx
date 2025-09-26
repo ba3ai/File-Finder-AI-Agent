@@ -63,12 +63,22 @@ const icons = {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 2h2v2h6V2h2v2h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3V2zm13 8H4v10h16V10z"/></svg>
   ),
   teams: (
-    // simple Teams-style glyph (kept light to avoid asset imports)
     <svg width="18" height="18" viewBox="0 0 48 48" fill="currentColor" aria-hidden="true">
       <path d="M20 14a6 6 0 1 1 0 12h-2v10c0 2.2 1.8 4 4 4h14a6 6 0 0 0 6-6V20h-6a6 6 0 0 1-6-6v-6H22a2 2 0 0 0-2 2v4h0Z" opacity=".2"/>
       <rect x="10" y="14" width="14" height="20" rx="3" />
       <circle cx="36" cy="12" r="6" />
       <path d="M14 18h10v4h-3v12h-4V22h-3v-4Z" fill="#0b1324"/>
+    </svg>
+  ),
+  sparkle: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2l2.5 6.5L21 11l-6.5 2.5L12 20l-2.5-6.5L3 11l6.5-2.5L12 2zM5 20l1.5-3.5L10 15l-3.5-1.5L5 10l-1.5 3.5L0 15l3.5 1.5L5 20zM24 9l-1-2.5L20.5 5 19 2l-1.5 3L14 5l3.5 1.5L19 10l1.5-3L24 9z"/>
+    </svg>
+  ),
+  // NEW: workspace glyph (map pin)
+  workspace: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7zm0 9.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z"/>
     </svg>
   ),
 };
@@ -95,6 +105,9 @@ export default function Sidebar({
   // Connected providers from API
   const [connMap, setConnMap] = useState({});
 
+  // Workspace info (for label only)
+  const [wsName, setWsName] = useState("");
+
   // UI
   const [acctOpen, setAcctOpen] = useState(false);
   const acctRef = useRef(null);
@@ -103,6 +116,10 @@ export default function Sidebar({
   // local scope when not controlled
   const [internalScope, setInternalScope] = useState("all");
   const scope = externalScope || internalScope;
+
+  // routes
+  const goToPricing = () => { window.location.href = "/pricing"; };
+  const goToWorkspace = () => { window.location.href = "/workspace"; };
 
   /* ----- data load ----- */
   useEffect(() => { (async () => {
@@ -117,6 +134,18 @@ export default function Sidebar({
       const d = await r.json();
       setConnMap(normalizeConnections(d));
     } catch { setConnMap({}); }
+  })(); }, []);
+  // Load workspace name (best-effort; if 402, we simply hide the name)
+  useEffect(() => { (async () => {
+    try {
+      const r = await fetch("/api/workspaces/me", { credentials: "include", cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        setWsName(j?.workspace?.name || "");
+      } else {
+        setWsName(""); // not on Team plan or no workspace yet
+      }
+    } catch { setWsName(""); }
   })(); }, []);
 
   /* account dropdown outside-click — only while open */
@@ -133,24 +162,13 @@ export default function Sidebar({
     const compact = raw.replace(/[\s_.-]+/g, "");
     const map = {
       microsoft: "microsoft", ms: "microsoft",
-
       sharepoint: "sharepoint", mssharepoint: "sharepoint",
       onedrive: "onedrive", msonedrive: "onedrive",
-
       google: "google", googledrive: "google", gdrive: "google", googledrivefiles: "google", google_drive: "google",
-
-      dropbox: "dropbox",
-      box: "box",
-      mega: "mega", meganz: "mega",
-
-      // Mail & calendars
-      outlook: "outlook", msoutlook: "outlook", o365mail: "outlook",
-      outlookcalendar: "outlook_calendar", outlookcal: "outlook_calendar", msoutlookcalendar: "outlook_calendar",
-      gmail: "gmail",
-      googlecalendar: "google_calendar", gcalendar: "google_calendar", google_cal: "google_calendar",
-
-      // NEW: Teams aliases
-      teams: "teams", msteams: "teams", microsoftteams: "teams",
+      dropbox: "dropbox", box: "box", mega: "mega",
+      outlook: "outlook", outlookcalendar: "outlook_calendar",
+      gmail: "gmail", googlecalendar: "google_calendar",
+      teams: "teams",
     };
     return map[compact] || raw;
   }
@@ -162,21 +180,14 @@ export default function Sidebar({
       for (const item of arr) {
         const prov = canonicalize(item.provider || item.type || item.name);
         const ok =
-          item.connected ??
-          item.is_connected ??
-          item.active ??
+          item.connected ?? item.is_connected ?? item.active ??
           (item.status === "connected" || item.status === true);
         if (prov) map[prov] = !!ok;
       }
-      // derive broad flags
-      if ("onedrive" in map || "sharepoint" in map) {
-        map.microsoft = map.microsoft || map.onedrive || map.sharepoint;
-      }
-      // If backend doesn't return the virtual providers, mirror them
+      if ("onedrive" in map || "sharepoint" in map) map.microsoft = map.microsoft || map.onedrive || map.sharepoint;
       if (map.microsoft) {
         if (!("outlook" in map)) map.outlook = true;
         if (!("outlook_calendar" in map)) map.outlook_calendar = true;
-        // Teams commonly uses the same MS Graph auth; mark as available if the app exposes it that way.
         if (!("teams" in map) && (map.sharepoint || map.onedrive)) map.teams = true;
       }
       if (map.google) {
@@ -185,7 +196,6 @@ export default function Sidebar({
       }
       return map;
     }
-    // object map fallback
     if (d && typeof d === "object") {
       for (const k of Object.keys(d)) map[canonicalize(k)] = !!d[k];
     }
@@ -201,20 +211,17 @@ export default function Sidebar({
       case "box":              return !!map.box;
       case "mega":             return !!map.mega;
 
-      // Mail & calendars
       case "outlook":          return !!(map.outlook || map.microsoft || map.sharepoint || map.onedrive);
       case "outlook_calendar": return !!(map.outlook_calendar || map.outlook || map.microsoft);
       case "gmail":            return !!(map.gmail || map.google);
       case "google_calendar":  return !!(map.google_calendar || map.google);
 
-      // NEW: Teams — allow either explicit connector flag or overall Microsoft flag
       case "teams":            return !!(map.teams || map.microsoft || map.sharepoint || map.onedrive);
       default:                 return true;
     }
   };
 
   /* ----- selection-only scope logic ----- */
-  // "Auto" remains file-connectors only (unchanged)
   const allKeys = ["sharepoint", "onedrive", "google", "dropbox", "box", "mega"];
 
   const getActiveSources = (sc, cmap) => {
@@ -225,7 +232,7 @@ export default function Sidebar({
     const flags = {
       sp: false, od: false, gd: false, dbx: false, box: false, mega: false,
       ol: false, ocal: false, gm: false, gcal: false,
-      teams: false, // NEW
+      teams: false,
     };
     const setForKey = (k) => {
       const on = isConnected(k, cmap);
@@ -235,12 +242,10 @@ export default function Sidebar({
       if (k === "dropbox")    flags.dbx = on;
       if (k === "box")        flags.box = on;
       if (k === "mega")       flags.mega = on;
-
       if (k === "outlook")          flags.ol = on;
       if (k === "outlook_calendar") flags.ocal = on;
       if (k === "gmail")            flags.gm = on;
       if (k === "google_calendar")  flags.gcal = on;
-
       if (k === "teams")            flags.teams = on;
     };
 
@@ -252,7 +257,6 @@ export default function Sidebar({
     return flags;
   };
 
-  // Only fire callbacks/storage when values actually change
   const prevScopeRef  = useRef(scope);
   const prevActiveRef = useRef(getActiveSources(scope, connMap));
   const prevFlagsRef  = useRef(computeFlags(scope, connMap));
@@ -278,7 +282,7 @@ export default function Sidebar({
       sessionStorage.setItem("src_ocal", flags.ocal ? "1" : "0");
       sessionStorage.setItem("src_gm",   flags.gm   ? "1" : "0");
       sessionStorage.setItem("src_gcal", flags.gcal ? "1" : "0");
-      sessionStorage.setItem("src_teams", flags.teams ? "1" : "0"); // NEW
+      sessionStorage.setItem("src_teams", flags.teams ? "1" : "0");
 
       window.dispatchEvent(new CustomEvent("sources:sync", { detail: flags }));
     }
@@ -289,7 +293,6 @@ export default function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, connMap]);
 
-  // Emit + receive global scope events (two-way sync with header)
   const emitScope = (nextScope) => {
     window.dispatchEvent(new CustomEvent(SCOPE_EVENT, { detail: { scope: nextScope, source: "sidebar" } }));
   };
@@ -307,7 +310,6 @@ export default function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, externalScope]);
 
-  // Setter that also emits the bus event
   const setScopeLocal = (next) => {
     if (!externalScope) setInternalScope(next);
     emitScope(next);
@@ -352,118 +354,52 @@ export default function Sidebar({
             Auto
           </Row>
 
-          <Row
-            icon={icons.msCloud}
-            active={scope === "sharepoint"}
-            onClick={() => setScopeLocal("sharepoint")}
-            right={<Dot on={isConnected("sharepoint")} />}
-            disabled={!isConnected("sharepoint")}
-          >
+          <Row icon={icons.msCloud} active={scope === "sharepoint"} onClick={() => setScopeLocal("sharepoint")} right={<Dot on={isConnected("sharepoint")} />} disabled={!isConnected("sharepoint")}>
             SharePoint
           </Row>
 
-          <Row
-            icon={icons.msCloud}
-            active={scope === "onedrive"}
-            onClick={() => setScopeLocal("onedrive")}
-            right={<Dot on={isConnected("onedrive")} />}
-            disabled={!isConnected("onedrive")}
-          >
+          <Row icon={icons.msCloud} active={scope === "onedrive"} onClick={() => setScopeLocal("onedrive")} right={<Dot on={isConnected("onedrive")} />} disabled={!isConnected("onedrive")}>
             OneDrive
           </Row>
 
-          <Row
-            icon={icons.gDrive}
-            active={scope === "google"}
-            onClick={() => setScopeLocal("google")}
-            right={<Dot on={isConnected("google")} />}
-            disabled={!isConnected("google")}
-          >
+          <Row icon={icons.gDrive} active={scope === "google"} onClick={() => setScopeLocal("google")} right={<Dot on={isConnected("google")} />} disabled={!isConnected("google")}>
             Google Drive
           </Row>
 
-          <Row
-            icon={icons.dropbox}
-            active={scope === "dropbox"}
-            onClick={() => setScopeLocal("dropbox")}
-            right={<Dot on={isConnected("dropbox")} />}
-            disabled={!isConnected("dropbox")}
-          >
+          <Row icon={icons.dropbox} active={scope === "dropbox"} onClick={() => setScopeLocal("dropbox")} right={<Dot on={isConnected("dropbox")} />} disabled={!isConnected("dropbox")}>
             Dropbox
           </Row>
 
-          <Row
-            icon={icons.box}
-            active={scope === "box"}
-            onClick={() => setScopeLocal("box")}
-            right={<Dot on={isConnected("box")} />}
-            disabled={!isConnected("box")}
-          >
+          <Row icon={icons.box} active={scope === "box"} onClick={() => setScopeLocal("box")} right={<Dot on={isConnected("box")} />} disabled={!isConnected("box")}>
             Box
           </Row>
 
-          <Row
-            icon={icons.mega}
-            active={scope === "mega"}
-            onClick={() => setScopeLocal("mega")}
-            right={<Dot on={isConnected("mega")} />}
-            disabled={!isConnected("mega")}
-          >
+          <Row icon={icons.mega} active={scope === "mega"} onClick={() => setScopeLocal("mega")} right={<Dot on={isConnected("mega")} />} disabled={!isConnected("mega")}>
             MEGA
           </Row>
 
-          {/* NEW: Collaboration */}
+          {/* Collaboration */}
           <div className="mt-3 mb-1 text-[11px] uppercase tracking-wide text-white/40 px-3">Collaboration</div>
-          <Row
-            icon={icons.teams}
-            active={scope === "teams"}
-            onClick={() => setScopeLocal("teams")}
-            right={<Dot on={isConnected("teams")} />}
-            disabled={!isConnected("teams")}
-          >
+          <Row icon={icons.teams} active={scope === "teams"} onClick={() => setScopeLocal("teams")} right={<Dot on={isConnected("teams")} />} disabled={!isConnected("teams")}>
             Microsoft Teams
           </Row>
 
           {/* Mail & Calendar */}
           <div className="mt-3 mb-1 text-[11px] uppercase tracking-wide text-white/40 px-3">Mail & Calendars</div>
 
-          <Row
-            icon={icons.mail}
-            active={scope === "outlook"}
-            onClick={() => setScopeLocal("outlook")}
-            right={<Dot on={isConnected("outlook")} />}
-            disabled={!isConnected("outlook")}
-          >
+          <Row icon={icons.mail} active={scope === "outlook"} onClick={() => setScopeLocal("outlook")} right={<Dot on={isConnected("outlook")} />} disabled={!isConnected("outlook")}>
             Outlook Mail
           </Row>
 
-          <Row
-            icon={icons.mail}
-            active={scope === "gmail"}
-            onClick={() => setScopeLocal("gmail")}
-            right={<Dot on={isConnected("gmail")} />}
-            disabled={!isConnected("gmail")}
-          >
+          <Row icon={icons.mail} active={scope === "gmail"} onClick={() => setScopeLocal("gmail")} right={<Dot on={isConnected("gmail")} />} disabled={!isConnected("gmail")}>
             Gmail
           </Row>
 
-          <Row
-            icon={icons.calendar}
-            active={scope === "outlook_calendar"}
-            onClick={() => setScopeLocal("outlook_calendar")}
-            right={<Dot on={isConnected("outlook_calendar")} />}
-            disabled={!isConnected("outlook_calendar")}
-          >
+          <Row icon={icons.calendar} active={scope === "outlook_calendar"} onClick={() => setScopeLocal("outlook_calendar")} right={<Dot on={isConnected("outlook_calendar")} />} disabled={!isConnected("outlook_calendar")}>
             Outlook Calendar
           </Row>
 
-          <Row
-            icon={icons.calendar}
-            active={scope === "google_calendar"}
-            onClick={() => setScopeLocal("google_calendar")}
-            right={<Dot on={isConnected("google_calendar")} />}
-            disabled={!isConnected("google_calendar")}
-          >
+          <Row icon={icons.calendar} active={scope === "google_calendar"} onClick={() => setScopeLocal("google_calendar")} right={<Dot on={isConnected("google_calendar")} />} disabled={!isConnected("google_calendar")}>
             Google Calendar
           </Row>
         </div>
@@ -474,7 +410,6 @@ export default function Sidebar({
         <div className="text-[11px] uppercase tracking-wide text-white/40 px-3 pt-3">Chats</div>
       </div>
 
-      {/* Unmount modal when closed to avoid overlay blocking clicks */}
       {searchOpen && (
         <SearchChatsModal
           isOpen={searchOpen}
@@ -548,6 +483,32 @@ export default function Sidebar({
           <div className="absolute bottom-14 left-3 right-3 z-50 rounded-xl border border-white/10 bg-[#111827] shadow-xl overflow-hidden">
             <div className="px-3 py-2 text-[11px] uppercase tracking-wide text-white/40">Account</div>
 
+            {/* Upgrade plan */}
+            <button
+              type="button"
+              onClick={() => { setAcctOpen(false); goToPricing(); }}
+              className="w-full flex items-center gap-3 px-3 py-2 text-sm text-white/90 hover:bg-white/5"
+            >
+              <span className="grid place-items-center h-7 w-7 rounded-full bg-white/10">{icons.sparkle}</span>
+              <div className="min-w-0 text-left">
+                <div className="truncate">Upgrade plan</div>
+                <div className="text-[11px] text-white/60 truncate">View pricing &amp; manage billing</div>
+              </div>
+            </button>
+
+            {/* NEW: Workspace */}
+            <button
+              type="button"
+              onClick={() => { setAcctOpen(false); goToWorkspace(); }}
+              className="w-full flex items-center gap-3 px-3 py-2 text-sm text-white/90 hover:bg-white/5"
+            >
+              <span className="grid place-items-center h-7 w-7 rounded-full bg-white/10">{icons.workspace}</span>
+              <div className="min-w-0 text-left">
+                <div className="truncate">{wsName || "Workspace"}</div>
+                <div className="text-[11px] text-white/60 truncate">{wsName ? "Manage members & seats" : "Team workspace"}</div>
+              </div>
+            </button>
+
             <button
               type="button"
               onClick={onOpenProfile}
@@ -557,7 +518,7 @@ export default function Sidebar({
                 {icons.user}
               </span>
               <div className="min-w-0 text-left">
-                <div className="truncate">Profile & Connections</div>
+                <div className="truncate">Profile &amp; Connections</div>
                 <div className="text-[11px] text-white/60 truncate">{me?.email || ""}</div>
               </div>
             </button>

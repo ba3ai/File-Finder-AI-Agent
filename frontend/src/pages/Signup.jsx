@@ -1,5 +1,5 @@
 // src/pages/Signup.jsx
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Eye, EyeOff, Mail, Lock } from "lucide-react";
 import { motion } from "framer-motion";
@@ -18,6 +18,20 @@ export default function Signup() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  // honor ?next= so invite flow resumes after auth
+  const next = useMemo(() => {
+    const p = new URLSearchParams(window.location.search);
+    const n = p.get("next");
+    return n && n.startsWith("/") ? n : "/";
+  }, []);
+
+  // prefill email if ?email=foo@bar was passed from the invite
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    const e = p.get("email");
+    if (e) setEmail(e);
+  }, []);
+
   const onSubmit = async (e) => {
     e.preventDefault();
     setError("");
@@ -35,7 +49,23 @@ export default function Signup() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Signup failed");
-      navigate("/login");
+
+      // Some backends auto-login after register; check if that happened.
+      const me = await fetch(`/api/auth/me`, {
+        credentials: "include",
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      }).then(r => r.json()).catch(() => ({}));
+
+      if (me?.ok || me?.email || me?.logged_in) {
+        // Already authenticated → continue to next (invite accept page).
+        window.location.replace(next);
+        return;
+      }
+
+      // Not logged in yet → bounce to login carrying next+email so flow resumes.
+      const q = new URLSearchParams({ next, email }).toString();
+      window.location.replace(`/login?${q}`);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -58,7 +88,6 @@ export default function Signup() {
             <div className="p-3 rounded-lg bg-red-50 text-red-700 text-sm">{error}</div>
           ) : null}
 
-          {/* Email */}
           <label className="block">
             <span className="sr-only">Email</span>
             <div className="relative">
@@ -74,7 +103,6 @@ export default function Signup() {
             </div>
           </label>
 
-          {/* Password */}
           <label className="block">
             <span className="sr-only">Create password</span>
             <div className="relative">
@@ -98,7 +126,6 @@ export default function Signup() {
             </div>
           </label>
 
-          {/* Confirm */}
           <label className="block">
             <span className="sr-only">Confirm password</span>
             <div className="relative">
@@ -132,7 +159,7 @@ export default function Signup() {
 
           <p className="text-center text-sm text-gray-600">
             Already have an account?{" "}
-            <Link to="/login" className="text-blue-600 hover:text-blue-700 font-medium">
+            <Link to={`/login?next=${encodeURIComponent(next)}${email ? `&email=${encodeURIComponent(email)}` : ""}`} className="text-blue-600 hover:text-blue-700 font-medium">
               Login
             </Link>
           </p>

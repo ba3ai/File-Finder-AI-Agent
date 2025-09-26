@@ -29,3 +29,4 @@ segno
 python-pptx
 ddgs
 dateparser
+stripe

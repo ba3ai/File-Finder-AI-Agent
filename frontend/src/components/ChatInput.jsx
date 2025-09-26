@@ -1,4 +1,4 @@
-// src/components/ChatInput.jsx — ChatGPT-style input with uploads, sources pills, and voice
+// src/components/ChatInput.jsx — input with FULL-WIDTH inline quote block (inside the composer)
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   FiMic, FiMicOff, FiSend, FiPlus, FiChevronDown,
@@ -14,7 +14,7 @@ const ACCEPT = [
   ".png",".jpg",".jpeg",".gif",".tiff",".bmp",".heic",".rtf",".yml",".yaml",".json"
 ].join(",");
 
-// The panel listens to this to close the file picker before a normal send.
+// ChatPanel listens to this to close the file picker before a normal send
 export const RESUME_EVENT = "file-select:ensure-resumed";
 
 export default function ChatInput({ onSend, disabled, userInput, setUserInput }) {
@@ -46,9 +46,43 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
     try { isListening ? r.stop() : r.start(); } catch {}
   };
 
+  /* ===== AskGPT + quote listeners ===== */
+  const taRef = useRef(null);
+  const [quote, setQuote] = useState(""); // quoted selection shown INSIDE the input
+
+  useEffect(() => {
+    const onInsert = (e) => {
+      const t = e?.detail?.text || "";
+      if (!t) return;
+      setUserInput(t);
+      requestAnimationFrame(() => taRef.current?.focus());
+    };
+    const onSendText = (e) => {
+      const t = e?.detail?.text || "";
+      if (!t.trim()) return;
+      window.dispatchEvent(new Event(RESUME_EVENT));
+      setUserInput(t);
+      doSend(t);
+    };
+    const onSetQuote = (e) => {
+      const t = (e?.detail?.text || "").trim();
+      if (!t) return;
+      setQuote(t);
+      requestAnimationFrame(() => taRef.current?.focus());
+    };
+
+    window.addEventListener("chat:insert-text", onInsert);
+    window.addEventListener("chat:send-text", onSendText);
+    window.addEventListener("chat:set-quote", onSetQuote);
+    return () => {
+      window.removeEventListener("chat:insert-text", onInsert);
+      window.removeEventListener("chat:send-text", onSendText);
+      window.removeEventListener("chat:set-quote", onSetQuote);
+    };
+  }, [setUserInput]);
+
   /* ===== textarea ===== */
   const [focused, setFocused] = useState(false);
-  const taRef = useRef(null);
   useEffect(() => { if (!disabled) requestAnimationFrame(() => taRef.current?.focus()); }, [disabled]);
   useEffect(() => { autosize(); }, [userInput]);
   const autosize = () => {
@@ -56,7 +90,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
     ta.style.height = "0px"; ta.style.height = Math.min(180, ta.scrollHeight) + "px";
   };
 
-  /* ===== Connections ===== */
+  /* ===== Connections (unchanged) ===== */
   const [connections, setConnections] = useState({
     sharepoint: { connected: false, account_email: null },
     onedrive:   { connected: false, account_email: null },
@@ -86,9 +120,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
       google_calendar: ["googlecalendar","gcalendar","googlecal","google_calendar"],
       teams: ["teams","msteams","microsoftteams","ms_teams","ms-teams"],
     };
-    for (const [key, aliases] of Object.entries(map)) {
-      if (aliases.includes(k)) return key;
-    }
+    for (const [key, aliases] of Object.entries(map)) if (aliases.includes(k)) return key;
     if (k.includes("sharepoint")) return "sharepoint";
     if (k.includes("onedrive")) return "onedrive";
     if (k.includes("outlook") && k.includes("calendar")) return "outlook_calendar";
@@ -135,7 +167,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
     })();
   }, []);
 
-  /* ===== Source flags ===== */
+  /* ===== Source flags (unchanged) ===== */
   const flagOrNull = (k) => {
     const v = sessionStorage.getItem(k);
     return v === null ? null : v === "1";
@@ -238,7 +270,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
   }, [connections,useSharePoint,useOneDrive,useGoogle,useDropbox,useBox,useMega,useOutlook,useGmail,useOutlookCal,useGoogleCal,useTeams]);
 
   /* ===== Uploads ===== */
-  const [uploads, setUploads] = useState([]);  // [{id,name,url,path}]
+  const [uploads, setUploads] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef(null);
@@ -290,18 +322,18 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
 
   /* ===== Send ===== */
   const doSend = (textOverride) => {
-    const text = (textOverride ?? userInput).trim();
-    if (!text && uploads.length === 0) return;
+    const instruction = (textOverride ?? userInput).trim();
+    const hasQuote = !!quote.trim();
+    const message = hasQuote ? `${instruction}\n\n"""${quote.trim()}"""` : instruction;
+    if (!message && uploads.length === 0) return;
 
-    // Let ChatPanel close the picker if it’s open
     window.dispatchEvent(new Event(RESUME_EVENT));
 
-    // Clone attachments so downstream mutations don’t wipe them
     const attachments = uploads.map(u => ({ ...u }));
-    onSend(text, null, activeSourcesArray(), { attachments });
+    onSend(message, null, activeSourcesArray(), { attachments });
 
-    // Clear composer state for next turn
     setUserInput("");
+    setQuote("");
     setUploads([]);
     requestAnimationFrame(() => taRef.current?.focus());
     setSourcesOpen(false);
@@ -312,7 +344,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
     <div className="px-4 pb-5 pt-3" onDrop={onDrop} onDragOver={onDragOver} onDragLeave={onDragLeave}>
       <div className="mx-auto max-w-[980px]">
 
-        {/* Attachment chips */}
+        {/* Attachment chips (outside composer, unchanged) */}
         {uploads.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2">
             {uploads.map((u) => (
@@ -331,6 +363,7 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
           </div>
         )}
 
+        {/* Composer wrapper with ring */}
         <div className="relative group">
           <div
             className={`pointer-events-none absolute -inset-0.5 rounded-[28px] blur transition-opacity duration-300 ${focused ? "opacity-100" : "opacity-60"}`}
@@ -338,98 +371,114 @@ export default function ChatInput({ onSend, disabled, userInput, setUserInput })
                      boxShadow: focused ? "0 0 40px rgba(224,195,137,.25)" : "none" }}
           />
           <div className="relative rounded-[26px] p-[2px]" style={{ background: FRAME }}>
-            <div className="relative flex items-end gap-2 rounded-[24px] border border-white/10 bg-[#0f152b]/70 px-3 py-2 backdrop-blur-xl shadow-[0_10px_30px_rgba(0,0,0,.5)]">
+            {/* Composer body as a COLUMN: full-width quote on top, then the row */}
+            <div className="relative rounded-[24px] border border-white/10 bg-[#0f152b]/70 px-3 py-2 backdrop-blur-xl shadow-[0_10px_30px_rgba(0,0,0,.5)] flex flex-col gap-2">
 
-              {/* Connectors shortcut */}
-              <button
-                type="button"
-                onClick={() => (window.location.href = "/dashboard")}
-                className="group rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5"
-                title="Connectors"
-                disabled={disabled}
-              >
-                <FiPlus size={18} />
-              </button>
+              {/* FULL-WIDTH quote block */}
+              {quote && (
+                <div className="w-full rounded-xl border border-white/10 bg-white/[.04] px-3 py-2 text-[13px] text-zinc-200">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <div className="font-medium text-zinc-100">Quoted text</div>
+                    <button
+                      onClick={() => setQuote("")}
+                      className="text-zinc-300 hover:text-white"
+                      title="Remove quote"
+                    >
+                      <FiX size={16} />
+                    </button>
+                  </div>
+                  <div className="rounded-lg bg-black/30 border border-white/10 px-3 py-2 whitespace-pre-wrap">
+                    {quote}
+                  </div>
+                </div>
+              )}
 
-              {/* Sources dropdown */}
-              <SourcesDropdown
-                open={sourcesOpen}
-                setOpen={setSourcesOpen}
-                refEl={sourcesRef}
-                connections={connections}
-                useSharePoint={useSharePoint} setUseSharePoint={setUseSharePoint}
-                useOneDrive={useOneDrive}     setUseOneDrive={setUseOneDrive}
-                useGoogle={useGoogle}         setUseGoogle={setUseGoogle}
-                useDropbox={useDropbox}       setUseDropbox={setUseDropbox}
-                useBox={useBox}               setUseBox={setUseBox}
-                useMega={useMega}             setUseMega={setUseMega}
-                useOutlook={useOutlook}       setUseOutlook={setUseOutlook}
-                useGmail={useGmail}           setUseGmail={setUseGmail}
-                useOutlookCal={useOutlookCal} setUseOutlookCal={setUseOutlookCal}
-                useGoogleCal={useGoogleCal}   setUseGoogleCal={setUseGoogleCal}
-                useTeams={useTeams}           setUseTeams={setUseTeams}
-                activeCount={activeSourcesArray().length}
-              />
+              {/* Row: left icons + textarea + right icons */}
+              <div className="flex items-end gap-2">
+                {/* Left: connectors & sources */}
+                <button
+                  type="button"
+                  onClick={() => (window.location.href = "/dashboard")}
+                  className="group rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5"
+                  title="Connectors"
+                  disabled={disabled}
+                >
+                  <FiPlus size={18} />
+                </button>
 
-              {/* Hidden file input */}
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                accept={ACCEPT}
-                onChange={onFilePicked}
-                className="hidden"
-              />
+                <SourcesDropdown
+                  open={sourcesOpen}
+                  setOpen={setSourcesOpen}
+                  refEl={sourcesRef}
+                  connections={connections}
+                  useSharePoint={useSharePoint} setUseSharePoint={setUseSharePoint}
+                  useOneDrive={useOneDrive}     setUseOneDrive={setUseOneDrive}
+                  useGoogle={useGoogle}         setUseGoogle={setUseGoogle}
+                  useDropbox={useDropbox}       setUseDropbox={setUseDropbox}
+                  useBox={useBox}               setUseBox={setUseBox}
+                  useMega={useMega}             setUseMega={setUseMega}
+                  useOutlook={useOutlook}       setUseOutlook={setUseOutlook}
+                  useGmail={useGmail}           setUseGmail={setUseGmail}
+                  useOutlookCal={useOutlookCal} setUseOutlookCal={setUseOutlookCal}
+                  useGoogleCal={useGoogleCal}   setUseGoogleCal={setUseGoogleCal}
+                  useTeams={useTeams}           setUseTeams={setUseTeams}
+                  activeCount={activeSourcesArray().length}
+                />
 
-              {/* Textarea */}
-              <textarea
-                ref={taRef}
-                autoFocus
-                rows={1}
-                className="flex-1 resize-none bg-transparent px-2 pb-1 pt-1 text-[15px] text-white placeholder:zinc-400 outline-none"
-                placeholder={isUploading ? "Uploading…" : "Type your prompt here…"}
-                value={userInput}
-                onChange={(e) => setUserInput(e.target.value)}
-                onKeyDown={onKeyDown}
-                onFocus={() => setFocused(true)}
-                onBlur={() => setFocused(false)}
-                disabled={disabled}
-              />
+                {/* Textarea expands */}
+                <textarea
+                  ref={taRef}
+                  autoFocus
+                  rows={1}
+                  className="flex-1 resize-none bg-transparent px-2 pb-1 pt-1 text-[15px] text-white placeholder:zinc-400 outline-none"
+                  placeholder={isUploading ? "Uploading…" : "Type your prompt here…"}
+                  value={userInput}
+                  onChange={(e) => setUserInput(e.target.value)}
+                  onKeyDown={onKeyDown}
+                  onFocus={() => setFocused(true)}
+                  onBlur={() => setFocused(false)}
+                  disabled={disabled}
+                />
 
-              {/* Paperclip */}
-              <button
-                type="button"
-                onClick={onPickClick}
-                className="relative grid place-items-center rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5 disabled:opacity-50"
-                title="Add photos & files"
-                disabled={disabled}
-              >
-                <FiPaperclip size={18} />
-              </button>
-
-              {/* Mic */}
-              <button
-                type="button"
-                onClick={toggleVoice}
-                className="relative grid place-items-center rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5 disabled:opacity-50"
-                title={isListening ? "Stop voice input" : "Voice input"}
-                disabled={disabled}
-              >
-                {isListening && <span className="absolute inset-0 -m-1 animate-ping rounded-full" style={{ backgroundColor: BRAND, opacity: 0.25 }} />}
-                {isListening ? <FiMicOff size={18} /> : <FiMic size={18} />}
-              </button>
-
-              {/* Send */}
-              <button
-                type="button"
-                onClick={() => doSend()}
-                className="grid place-items-center rounded-full p-2 text-[#1b1720] shadow-lg disabled:opacity-50"
-                title="Send"
-                disabled={disabled || isUploading}
-                style={{ background: "linear-gradient(180deg, #F1DFB1 0%, #E0C389 50%, #CBA360 100%)" }}
-              >
-                <FiSend size={18} />
-              </button>
+                {/* Right controls */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={ACCEPT}
+                  onChange={onFilePicked}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={onPickClick}
+                  className="relative grid place-items-center rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5 disabled:opacity-50"
+                  title="Add photos & files"
+                  disabled={disabled}
+                >
+                  <FiPaperclip size={18} />
+                </button>
+                <button
+                  type="button"
+                  onClick={toggleVoice}
+                  className="relative grid place-items-center rounded-full p-2 text-zinc-300 hover:text-white hover:bg-white/5 disabled:opacity-50"
+                  title={isListening ? "Stop voice input" : "Voice input"}
+                  disabled={disabled}
+                >
+                  {isListening && <span className="absolute inset-0 -m-1 animate-ping rounded-full" style={{ backgroundColor: BRAND, opacity: 0.25 }} />}
+                  {isListening ? <FiMicOff size={18} /> : <FiMic size={18} />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => doSend()}
+                  className="grid place-items-center rounded-full p-2 text-[#1b1720] shadow-lg disabled:opacity-50"
+                  title="Send"
+                  disabled={disabled || isUploading}
+                  style={{ background: "linear-gradient(180deg, #F1DFB1 0%, #E0C389 50%, #CBA360 100%)" }}
+                >
+                  <FiSend size={18} />
+                </button>
+              </div>
             </div>
 
             {/* Drag overlay */}
@@ -490,7 +539,7 @@ function SourcesDropdown(props) {
       </button>
 
       {open && (
-        <div className="absolute left-0 bottom-11 w-[360px] rounded-2xl border border-white/10 bg-[#0b1124]/95 backdrop-blur-xl shadow-2xl">
+        <div className="absolute left-0 bottom-11 w=[360px] md:w-[360px] w-[320px] rounded-2xl border border-white/10 bg-[#0b1124]/95 backdrop-blur-xl shadow-2xl">
           <div className="px-3 py-2 text-xs font-semibold text-zinc-300 border-b border-white/10">
             Search connected sources
           </div>

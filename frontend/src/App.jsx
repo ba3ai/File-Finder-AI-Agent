@@ -13,6 +13,19 @@ import Sidebar from "./components/Sidebar.jsx";
 import ProfileModal from "./components/ProfileModal.jsx";
 import ConnectionModal from "./components/ConnectionModal.jsx"; // global connections UI
 
+import SuperAdminLayout from './pages/superadmin/SuperAdminLayout.jsx';
+import SAUserList from './pages/superadmin/UserList.jsx';
+import Overview from "./pages/superadmin/Overview.jsx";
+import SAAddUser from './pages/superadmin/AddUser.jsx';
+import SASubscriptions from './pages/superadmin/Subscriptions.jsx';
+import SAStatuses from './pages/superadmin/Statuses.jsx';
+import SATickets from './pages/superadmin/Tickets.jsx';
+import SARevenue from './pages/superadmin/Revenue.jsx';
+import StaffLogin from "./pages/staff/StaffLogin";
+import Pricing from "./pages/Pricing.jsx";
+import Workspace from "./components/Workspace.jsx";
+import WorkspaceAccept from "./pages/WorkspaceAccept";
+
 // Pages
 import Login from "./pages/Login.jsx";
 import Signup from "./pages/Signup.jsx";
@@ -32,6 +45,36 @@ async function apiFetch(url, options = {}) {
     throw new Error("trial_expired");
   }
   return res;
+}
+
+/* NEW: Guard that checks staff session via /api/admin/staff/me */
+function StaffProtectedRoute({ children }) {
+  const [state, setState] = React.useState({ loading: true, ok: false });
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/api/admin/staff/me", {
+          credentials: "include",
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        });
+        const j = await r.json();
+        setState({ loading: false, ok: !!j?.is_staff });
+      } catch {
+        setState({ loading: false, ok: false });
+      }
+    })();
+  }, []);
+
+  if (state.loading) {
+    return (
+      <div className="flex h-screen items-center justify-center text-white bg-[#0b1324]">
+        Checking staff access…
+      </div>
+    );
+  }
+  return state.ok ? children : <Navigate to="/staff/login" replace />;
 }
 
 async function isTrialExpired() {
@@ -538,6 +581,37 @@ export default function App() {
   return (
     <Router>
       <Routes>
+              {/* Staff login page */}
+        <Route path="/staff/login" element={<StaffLogin />} />
+        <Route path="/pricing" element={<Pricing />} />
+        <Route
+          path="/workspace"
+          element={
+            <ProtectedRoute>
+              <Workspace />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="/workspace/accept" element={<WorkspaceAccept />} />
+
+        {/* ⬇️ CHANGE: wrap superadmin with StaffProtectedRoute (not ProtectedRoute) */}
+        <Route
+          path="/superadmin"
+          element={
+            <StaffProtectedRoute>
+              <SuperAdminLayout />
+            </StaffProtectedRoute>
+          }
+        >
+          <Route index element={<SAUserList />} />
+          <Route path="overview" element={<Overview />} />
+          <Route path="userlist" element={<SAUserList />} />
+          <Route path="add-user" element={<SAAddUser />} />
+          <Route path="subscriptions" element={<SASubscriptions />} />
+          <Route path="statuses" element={<SAStatuses />} />
+          <Route path="tickets" element={<SATickets />} />
+          <Route path="revenue" element={<SARevenue />} />
+        </Route>
         {/* Public */}
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<Signup />} />
